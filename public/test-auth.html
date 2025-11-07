@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prueba Auth - BOVIPRED</title>
+  <style>
+    body{font-family:system-ui,Arial;background:#f7fafc;margin:40px}
+    button{margin:6px;padding:8px 12px}
+    pre{background:#fff;border:1px solid #e2e8f0;padding:12px;max-width:900px}
+  </style>
+</head>
+<body>
+  <h2>Pruebas rápidas de autenticación</h2>
+  <p>Usa los botones para registrar/login/profile/logout. Guarda el token en <code>localStorage</code>.</p>
+  <div>
+    <button id="register">Register</button>
+    <button id="login">Login</button>
+    <button id="profile">Profile</button>
+    <button id="logout">Logout</button>
+    <button id="clear">Clear token</button>
+  </div>
+  <p>Endpoint base: <code>/api/v1/</code></p>
+  <pre id="out">Listo. Haz click en un botón.</pre>
+
+  <script>
+    const outEl = document.getElementById('out')
+    const out = (v) => { outEl.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2) }
+
+    async function doFetch(path, opts={}){
+      try{
+        const res = await fetch(path, opts)
+        const json = await res.json().catch(()=>null)
+        return {status: res.status, ok: res.ok, body: json}
+      }catch(e){ return {status:0, ok:false, body: String(e)} }
+    }
+
+    document.getElementById('register').onclick = async ()=>{
+      const r = await doFetch('/api/v1/auth/register', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name:'Juan', apellido:'Perez', email:'juan-html@example.com', password:'secret123', password_confirmation:'secret123'})
+      })
+      out(r)
+      if(r.body && r.body.data && r.body.data.token) localStorage.setItem('api_token', r.body.data.token)
+    }
+
+    document.getElementById('login').onclick = async ()=>{
+      const r = await doFetch('/api/v1/auth/login', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({email:'juan-html@example.com', password:'secret123'})
+      })
+      out(r)
+      if(r.body && r.body.data && r.body.data.token) localStorage.setItem('api_token', r.body.data.token)
+    }
+
+    document.getElementById('profile').onclick = async ()=>{
+      const token = localStorage.getItem('api_token') || ''
+      const r = await doFetch('/api/v1/auth/profile', { method:'GET', headers: { 'Authorization': 'Bearer ' + token } })
+      out(r)
+    }
+
+    document.getElementById('logout').onclick = async ()=>{
+      const token = localStorage.getItem('api_token') || ''
+      const r = await doFetch('/api/v1/auth/logout', { method:'POST', headers: { 'Authorization': 'Bearer ' + token } })
+      out(r)
+      if(r.ok) localStorage.removeItem('api_token')
+    }
+
+    document.getElementById('clear').onclick = ()=>{ localStorage.removeItem('api_token'); out('token cleared') }
+  </script>
+</body>
+</html>
