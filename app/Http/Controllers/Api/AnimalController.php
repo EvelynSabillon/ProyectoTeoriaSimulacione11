@@ -17,9 +17,11 @@ class AnimalController extends Controller
     {
         $query = Animal::with(['ultimoIatf', 'grupo']);
 
-        // Filtros opcionales
+        // Filtro opcional
         if ($request->has('activo')) {
-            $query->where('activo', $request->activo);
+            // Convertir string a boolean
+            $activo = filter_var($request->activo, FILTER_VALIDATE_BOOLEAN);
+            $query->where('activo', $activo);
         }
 
         if ($request->has('grupo_id')) {

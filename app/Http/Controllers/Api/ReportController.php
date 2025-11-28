@@ -74,7 +74,7 @@ class ReportController extends Controller
         // Calcular estadísticas
         $totalIatf = $registros->count();
         $prenecesConfirmadas = $registros->where('prenez_confirmada', true)->count();
-        $muertesEmbrionarias = $registros->where('resultado_iatf', 'ME')->count();
+        $muertesEmbrionarias = $registros->where('resultado_iatf', 'muerte_embrionaria')->count();
         $noGestantes = $registros->where('resultado_iatf', 'X')->count();
         $pendientes = $registros->where('resultado_iatf', 'Pendiente')->count();
 
@@ -273,7 +273,7 @@ class ReportController extends Controller
 
             $total = $registros->count();
             $confirmadas = $registros->where('prenez_confirmada', true)->count();
-            $muertesEmb = $registros->where('resultado_iatf', 'ME')->count();
+            $muertesEmb = $registros->where('resultado_iatf', 'muerte_embrionaria')->count();
 
             return [
                 'id' => $semental->id,

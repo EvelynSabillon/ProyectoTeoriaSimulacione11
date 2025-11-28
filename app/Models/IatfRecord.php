@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Facades\Log;
 
 class IatfRecord extends Model
 {
@@ -35,6 +36,7 @@ class IatfRecord extends Model
         'ecg_ml',
         'pf2_alpha_ml',
         'hora_iatf',
+        'hora_iatf_score',
         'epoca_anio',
         'temperatura_ambiente',
         'humedad_relativa',
@@ -58,6 +60,7 @@ class IatfRecord extends Model
         'fecha_protocolo_dia_9' => 'datetime',
         'fecha_protocolo_dia_10' => 'datetime',
         'hora_iatf' => 'datetime:H:i',
+        'hora_iatf_score' => 'integer',
         'desparasitacion_previa' => 'boolean',
         'vitaminas_aplicadas' => 'boolean',
         'dispositivo_dib' => 'boolean',
@@ -81,7 +84,10 @@ class IatfRecord extends Model
         'dias_gestacion_confirmada' => 'integer',
     ];
 
-    // Relaciones
+    // =========================================================================
+    // RELACIONES
+    // =========================================================================
+
     public function animal()
     {
         return $this->belongsTo(Animal::class);
@@ -97,7 +103,10 @@ class IatfRecord extends Model
         return $this->hasOne(Prediction::class);
     }
 
-    // Scopes
+    // =========================================================================
+    // SCOPES
+    // =========================================================================
+
     public function scopeConfirmadas($query)
     {
         return $query->where('resultado_iatf', 'confirmada');
@@ -113,7 +122,10 @@ class IatfRecord extends Model
         return $query->whereBetween('fecha_iatf', [$inicio, $fin]);
     }
 
-    // Accessors
+    // =========================================================================
+    // ACCESSORS
+    // =========================================================================
+
     public function getResultadoLabelAttribute()
     {
         $labels = [
@@ -123,5 +135,98 @@ class IatfRecord extends Model
             'pendiente' => 'Pendiente',
         ];
         return $labels[$this->resultado_iatf] ?? $this->resultado_iatf;
+    }
+
+    // =========================================================================
+    // ⭐ AGREGAR ESTE MÉTODO COMPLETO ⭐
+    // =========================================================================
+
+    /**
+     * Boot method - Auto-actualización de estadísticas del semental
+     */
+    protected static function boot()
+    {
+        parent::boot();
+
+        // =====================================================================
+        // EVENTO: Después de ACTUALIZAR un registro IATF
+        // =====================================================================
+        static::updated(function ($iatfRecord) {
+            try {
+                // Solo si tiene semental asociado
+                if (!$iatfRecord->semental_id) {
+                    return;
+                }
+
+                // Detectar si cambió prenez_confirmada o resultado_iatf
+                if ($iatfRecord->isDirty('prenez_confirmada') || 
+                    $iatfRecord->isDirty('resultado_iatf')) {
+                    
+                    Log::info("📊 Actualizando estadísticas de semental por cambio en IATF", [
+                        'iatf_record_id' => $iatfRecord->id,
+                        'semental_id' => $iatfRecord->semental_id,
+                        'prenez_confirmada' => $iatfRecord->prenez_confirmada,
+                        'resultado_iatf' => $iatfRecord->resultado_iatf,
+                    ]);
+
+                    $iatfRecord->semental->actualizarEstadisticas();
+                }
+
+            } catch (\Exception $e) {
+                // No fallar la actualización del IATF si falla la estadística
+                Log::error("❌ Error actualizando estadísticas del semental", [
+                    'iatf_record_id' => $iatfRecord->id,
+                    'semental_id' => $iatfRecord->semental_id ?? null,
+                    'error' => $e->getMessage(),
+                    'trace' => $e->getTraceAsString(),
+                ]);
+            }
+        });
+
+        // =====================================================================
+        // EVENTO: Después de CREAR un registro IATF con resultado
+        // =====================================================================
+        static::created(function ($iatfRecord) {
+            try {
+                // Solo si tiene semental y ya tiene resultado
+                if ($iatfRecord->semental_id && !is_null($iatfRecord->prenez_confirmada)) {
+                    
+                    Log::info("📊 Actualizando estadísticas de semental por nuevo IATF", [
+                        'iatf_record_id' => $iatfRecord->id,
+                        'semental_id' => $iatfRecord->semental_id,
+                        'prenez_confirmada' => $iatfRecord->prenez_confirmada,
+                    ]);
+
+                    $iatfRecord->semental->actualizarEstadisticas();
+                }
+            } catch (\Exception $e) {
+                Log::error("❌ Error actualizando estadísticas al crear IATF", [
+                    'iatf_record_id' => $iatfRecord->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        });
+
+        // =====================================================================
+        // EVENTO: Después de ELIMINAR un registro IATF (soft delete)
+        // =====================================================================
+        static::deleted(function ($iatfRecord) {
+            try {
+                if ($iatfRecord->semental_id) {
+                    
+                    Log::info("📊 Actualizando estadísticas de semental por eliminación de IATF", [
+                        'iatf_record_id' => $iatfRecord->id,
+                        'semental_id' => $iatfRecord->semental_id,
+                    ]);
+
+                    $iatfRecord->semental->actualizarEstadisticas();
+                }
+            } catch (\Exception $e) {
+                Log::error("❌ Error actualizando estadísticas al eliminar IATF", [
+                    'iatf_record_id' => $iatfRecord->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        });
     }
 }

@@ -52,6 +52,7 @@ Route::prefix('v1')->group(function () {
         // === PREDICCIONES ===
         Route::apiResource('predictions', PredictionController::class)->only(['index', 'store', 'show']);
         Route::get('predictions/estadisticas/general', [PredictionController::class, 'estadisticas']);
+        Route::put('predictions/{id}/resultado', [PredictionController::class, 'registrarResultado']);
 
         // === REPORTES ===
         Route::get('reports', [ReportController::class, 'index']);
@@ -75,5 +76,20 @@ Route::get('/test', function () {
         'message' => 'API BOVIPRED funcionando correctamente',
         'version' => '1.0.0',
         'timestamp' => now(),
+    ]);
+});
+
+// Ruta de diagnóstico para grupos
+Route::get('/debug-grupos', function () {
+    $total = \App\Models\Grupo::count();
+    $grupos = \App\Models\Grupo::all();
+    $activos = \App\Models\Grupo::where('activo', true)->get();
+    $inactivos = \App\Models\Grupo::where('activo', false)->get();
+    
+    return response()->json([
+        'total_grupos' => $total,
+        'todos_grupos' => $grupos,
+        'grupos_activos' => $activos,
+        'grupos_inactivos' => $inactivos,
     ]);
 });

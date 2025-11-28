@@ -3,12 +3,13 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\IatfRecord;
 use App\Models\Prediction;
+use App\Models\IatfRecord;
 use App\Models\ActivityLog;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 class PredictionController extends Controller
 {
@@ -19,12 +20,13 @@ class PredictionController extends Controller
     {
         $query = Prediction::with(['iatfRecord.animal', 'iatfRecord.semental', 'user']);
 
+        
         if ($request->has('nivel_confianza')) {
             $query->where('nivel_confianza', $request->nivel_confianza);
         }
 
         if ($request->has('validadas')) {
-            if ($request->validadas) {
+            if ($request->validadas === 'true') {
                 $query->whereNotNull('resultado_real');
             } else {
                 $query->whereNull('resultado_real');
@@ -40,7 +42,7 @@ class PredictionController extends Controller
     }
 
     /**
-     * Crear predicción (llamada al modelo ML)
+     * Crear predicción usando API Flask de ML
      */
     public function store(Request $request)
     {
@@ -68,45 +70,367 @@ class PredictionController extends Controller
             ], 409);
         }
 
-        // Preparar datos para el modelo ML
-        $datosParaML = $this->prepararDatosParaML($iatfRecord);
+        // Validar que el registro tenga los datos mínimos necesarios
+        $validacion = $this->validarDatosMinimos($iatfRecord);
+        if (!$validacion['valido']) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Datos insuficientes para predicción',
+                'errores' => $validacion['errores'],
+            ], 422);
+        }
 
-        // OPCIÓN A: Llamar a API Python/Flask (cuando esté disponible)
-        // $resultado = $this->llamarAPIML($datosParaML);
+        try {
+            // Preparar datos para la API Flask
+            $datosParaML = $this->prepararDatosParaML($iatfRecord);
 
-        // OPCIÓN B: Simulación (mientras no tengas Python)
-        $resultado = $this->simularPrediccion($datosParaML);
+            // Llamar a la API Flask
+            $resultado = $this->llamarAPIFlask($datosParaML);
 
-        // Crear registro de predicción
-        $prediction = Prediction::create([
-            'iatf_record_id' => $iatfRecord->id,
-            'user_id' => auth()->id(),
-            'probabilidad_prenez' => $resultado['probabilidad_prenez'],
-            'prediccion_binaria' => $resultado['prediccion_binaria'],
-            'nivel_confianza' => $resultado['nivel_confianza'],
-            'modelo_usado' => $resultado['modelo_usado'],
-            'version_modelo' => $resultado['version_modelo'],
-            'accuracy' => $resultado['metricas']['accuracy'] ?? null,
-            'precision' => $resultado['metricas']['precision'] ?? null,
-            'recall' => $resultado['metricas']['recall'] ?? null,
-            'f1_score' => $resultado['metricas']['f1_score'] ?? null,
-            'roc_auc' => $resultado['metricas']['roc_auc'] ?? null,
-            'top_features' => $resultado['top_features'] ?? null,
-            'recomendaciones' => $resultado['recomendaciones'] ?? null,
-        ]);
+            // Crear registro de predicción
+            $prediction = Prediction::create([
+                'iatf_record_id' => $iatfRecord->id,
+                'user_id' => auth()->id(),
+                'probabilidad_prenez' => $resultado['probabilidad_prenez'],
+                'prediccion_binaria' => $resultado['prediccion_binaria'],
+                'nivel_confianza' => $resultado['nivel_confianza'],
+                'modelo_usado' => $resultado['modelo_usado'],
+                'version_modelo' => $resultado['version_modelo'],
+                'accuracy' => $resultado['metricas']['accuracy'] ?? null,
+                'precision' => $resultado['metricas']['precision'] ?? null,
+                'recall' => $resultado['metricas']['recall'] ?? null,
+                'f1_score' => $resultado['metricas']['f1_score'] ?? null,
+                'roc_auc' => $resultado['metricas']['roc_auc'] ?? null,
+                'top_features' => $resultado['top_features'] ?? null,
+                'recomendaciones' => $resultado['recomendaciones'] ?? null,
+            ]);
 
-        ActivityLog::registrar(
-            'predecir',
-            'Prediction',
-            $prediction->id,
-            "Predicción generada para IATF ID: {$iatfRecord->id}"
+            ActivityLog::registrar(
+                'predecir',
+                'Prediction',
+                $prediction->id,
+                "Predicción generada para IATF ID: {$iatfRecord->id}"
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Predicción generada exitosamente',
+                'data' => $prediction->load(['iatfRecord.animal', 'iatfRecord.semental']),
+                'resultado_ml' => $resultado, // Info adicional de la API
+            ], 201);
+
+        } catch (\Exception $e) {
+            Log::error('Error en predicción ML', [
+                'iatf_record_id' => $iatfRecord->id,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Error al generar predicción',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Validar que el registro IATF tenga los datos mínimos necesarios
+     */
+    private function validarDatosMinimos($iatfRecord)
+    {
+        $errores = [];
+        $animal = $iatfRecord->animal;
+        $semental = $iatfRecord->semental;
+
+        // Validar datos del animal
+        if (!$animal) {
+            $errores[] = 'No se encontró el animal asociado';
+        } else {
+            if (is_null($animal->edad_meses)) {
+                $errores[] = 'El animal no tiene edad registrada';
+            }
+            if (is_null($animal->condicion_corporal)) {
+                $errores[] = 'El animal no tiene condición corporal (BCS) registrada';
+            }
+            if (is_null($animal->dias_posparto)) {
+                $errores[] = 'El animal no tiene días posparto registrados';
+            }
+            if (is_null($animal->numero_partos)) {
+                $errores[] = 'El animal no tiene número de partos registrado';
+            }
+        }
+
+        // Validar datos del registro IATF
+        if (is_null($iatfRecord->condicion_ovarica_od)) {
+            $errores[] = 'Falta condición ovárica derecha';
+        }
+        if (is_null($iatfRecord->condicion_ovarica_oi)) {
+            $errores[] = 'Falta condición ovárica izquierda';
+        }
+        if (is_null($iatfRecord->tono_uterino)) {
+            $errores[] = 'Falta tono uterino';
+        }
+        if (is_null($iatfRecord->tratamiento_previo)) {
+            $errores[] = 'Falta tratamiento previo';
+        }
+
+        // Validar semental
+        if (!$semental) {
+            $errores[] = 'No se encontró el semental asociado';
+        } elseif (is_null($semental->tasa_historica_prenez)) {
+            $errores[] = 'El semental no tiene tasa histórica de preñez calculada';
+        }
+
+        return [
+            'valido' => empty($errores),
+            'errores' => $errores
+        ];
+    }
+
+    /**
+     * Preparar datos en el formato exacto que espera la API Flask
+     */
+    private function prepararDatosParaML($iatfRecord)
+    {
+        $animal = $iatfRecord->animal;
+        $semental = $iatfRecord->semental;
+
+        return [
+            // 1. condicion_ov_od - Estado ovario derecho
+            'condicion_ov_od' => strtoupper($iatfRecord->condicion_ovarica_od),
+            
+            // 2. condicion_ov_oi - Estado ovario izquierdo
+            'condicion_ov_oi' => strtoupper($iatfRecord->condicion_ovarica_oi),
+            
+            // 3. tono_uterino - Tonicidad del útero (0-100)
+            'tono_uterino' => (float) $iatfRecord->tono_uterino,
+            
+            // 4. tratamiento - Mapear valores
+            'tratamiento' => $this->mapearTratamiento($iatfRecord->tratamiento_previo),
+            
+            // 5. edad_animal - Convertir meses a años
+            'edad_animal' => (int) floor($animal->edad_meses / 12),
+            
+            // 6. bcs - Body Condition Score (1-5)
+            'bcs' => (int) round($animal->condicion_corporal),
+            
+            // 7. dias_posparto - Días desde último parto
+            'dias_posparto' => (int) $animal->dias_posparto,
+            
+            // 8. num_partos - Número de partos previos
+            'num_partos' => (int) $animal->numero_partos,
+            
+            // 9. dias_tonificacion - Duración del tratamiento
+            'dias_tonificacion' => (int) ($iatfRecord->dias_tonificacion ?? 0),
+            
+            // 10. sal_mineral - Gramos/día
+            'sal_mineral' => (float) ($iatfRecord->sal_mineral_gr ?? 110), // Default 110
+            
+            // 11. desparasitacion - Binaria (0 o 1)
+            'desparasitacion' => $iatfRecord->desparasitacion_previa ? 1 : 0,
+            
+            // 12. hora_iatf_score - Calcular desde hora_iatf
+            'hora_iatf_score' => $this->calcularHoraIatfScore($iatfRecord->hora_iatf),
+            
+            // 13. epoca_año - Mapear y convertir a mayúsculas
+            'epoca_año' => $this->mapearEpocaAnio($iatfRecord->epoca_anio),
+            
+            // 14. semental_tasa_prenez - Tasa histórica del semental
+            'semental_tasa_prenez' => (float) ($semental->tasa_historica_prenez ?? 50), // Default 50%
+        ];
+    }
+
+    /**
+     * Mapear tratamiento de Laravel a formato API
+     */
+    private function mapearTratamiento($tratamiento)
+    {
+        $mapeo = [
+            'T1' => 'T1',
+            'T2' => 'T2',
+            'RS' => 'NINGUNO',
+            'DESCARTE' => 'NINGUNO',
+            null => 'NINGUNO',
+        ];
+
+        return $mapeo[strtoupper($tratamiento ?? '')] ?? 'NINGUNO';
+    }
+
+    /**
+     * Calcular score de hora IATF
+     */
+    private function calcularHoraIatfScore($horaIatf)
+    {
+        if (!$horaIatf) {
+            return 0; // Valor por defecto si no hay hora
+        }
+
+        // Extraer hora (formato esperado: "HH:MM")
+        $hora = (int) substr($horaIatf, 0, 2);
+
+        // Scoring basado en ventana óptima
+        if ($hora >= 6 && $hora < 10) {
+            return 2; // ÓPTIMO (6am-10am)
+        } elseif ($hora >= 10 && $hora < 14) {
+            return 1; // BUENO (10am-2pm)
+        } elseif ($hora >= 14 && $hora < 18) {
+            return 0; // ACEPTABLE (2pm-6pm)
+        } else {
+            return -1; // FUERA DE PROTOCOLO
+        }
+    }
+
+    /**
+     * Mapear época del año
+     */
+    private function mapearEpocaAnio($epoca)
+    {
+        $mapeo = [
+            'verano' => 'VERANO',
+            'invierno' => 'INVIERNO',
+            'lluvias' => 'LLUVIAS',
+            'seca' => 'SECA',
+            null => 'VERANO', // Default
+        ];
+
+        return $mapeo[strtolower($epoca ?? 'verano')] ?? 'VERANO';
+    }
+
+    /**
+     * Llamar a la API Flask de Machine Learning
+     */
+    private function llamarAPIFlask($datos)
+    {
+        $apiUrl = env('ML_API_URL', 'http://localhost:5000');
+
+        try {
+            // Verificar salud de la API primero
+            $healthCheck = Http::timeout(5)->get("{$apiUrl}/health");
+            
+            if (!$healthCheck->successful() || $healthCheck->json('status') !== 'healthy') {
+                throw new \Exception('API Flask no está disponible');
+            }
+
+            // Hacer la predicción
+            $response = Http::timeout(30)->post("{$apiUrl}/api/predict", [
+                'data' => $datos,
+                'models' => ['random_forest', 'xgboost'] // Solo los 2 modelos disponibles
+            ]);
+
+            if (!$response->successful()) {
+                $errorBody = $response->json();
+                throw new \Exception(
+                    $errorBody['message'] ?? 'Error desconocido en API Flask'
+                );
+            }
+
+            $resultado = $response->json();
+
+            // Transformar respuesta de Flask al formato Laravel
+            return $this->transformarRespuestaFlask($resultado);
+
+        } catch (\Illuminate\Http\Client\ConnectionException $e) {
+            Log::error('No se pudo conectar a la API Flask', [
+                'url' => $apiUrl,
+                'error' => $e->getMessage()
+            ]);
+            
+            throw new \Exception(
+                'No se pudo conectar a la API de Machine Learning. ' .
+                'Verifique que el servidor Flask esté corriendo en ' . $apiUrl
+            );
+        }
+    }
+
+    /**
+     * Transformar respuesta de Flask al formato esperado por Laravel
+     */
+    private function transformarRespuestaFlask($respuestaFlask)
+    {
+        $consensus = $respuestaFlask['consensus'];
+        $predictions = $respuestaFlask['predictions'];
+        $riskFactors = $respuestaFlask['risk_factors'] ?? [];
+
+        // Determinar nivel de confianza basado en consenso
+        $nivelConfianza = match($consensus['confianza']) {
+            'Alta' => 'alto',
+            'Media' => 'medio',
+            'Baja' => 'bajo',
+            default => 'medio'
+        };
+
+        // Extraer métricas del modelo desde la respuesta Flask
+        $consensusMetrics = $respuestaFlask['model_metrics']['consensus'] ?? [];
+        $metricas = [
+            'accuracy' => $consensusMetrics['accuracy'] ?? null,
+            'precision' => $consensusMetrics['precision'] ?? null,
+            'recall' => $consensusMetrics['recall'] ?? null,
+            'f1_score' => $consensusMetrics['f1_score'] ?? null,
+            'roc_auc' => $consensusMetrics['roc_auc'] ?? null,
+        ];
+
+        // Extraer features importantes desde Flask
+        $topFeatures = $respuestaFlask['feature_importance'] ?? [];
+
+        // Generar recomendaciones basadas en factores de riesgo
+        $recomendaciones = $this->generarRecomendacionesDesdeRiesgos(
+            $riskFactors,
+            $consensus['probabilidad_promedio']
         );
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Predicción generada exitosamente',
-            'data' => $prediction->load(['iatfRecord.animal', 'iatfRecord.semental']),
-        ], 201);
+        return [
+            'probabilidad_prenez' => $consensus['probabilidad_promedio'] / 100, // Convertir a decimal
+            'prediccion_binaria' => $consensus['prediccion'] === 1,
+            'nivel_confianza' => $nivelConfianza,
+            'modelo_usado' => 'Consenso (Random Forest + XGBoost)',
+            'version_modelo' => '1.0',
+            'metricas' => $metricas,
+            'top_features' => $topFeatures,
+            'recomendaciones' => $recomendaciones,
+            'detalles_modelos' => $predictions,
+            'factores_riesgo' => $riskFactors,
+        ];
+    }
+
+    /**
+     * Generar recomendaciones desde factores de riesgo
+     */
+    private function generarRecomendacionesDesdeRiesgos($factoresRiesgo, $probabilidad)
+    {
+        $recomendaciones = [];
+
+        if ($probabilidad < 40) {
+            $recomendaciones[] = "⚠️ Probabilidad baja de preñez ({$probabilidad}%). Evaluar condiciones del animal antes de proceder.";
+        }
+
+        foreach ($factoresRiesgo as $factor) {
+            if (str_contains($factor, 'Condición ovárica')) {
+                $recomendaciones[] = "🔸 {$factor}. Considerar tratamiento hormonal adicional.";
+            } elseif (str_contains($factor, 'Tono uterino')) {
+                $recomendaciones[] = "💊 {$factor}. Reforzar protocolo de tonificación.";
+            } elseif (str_contains($factor, 'Sin tratamiento')) {
+                $recomendaciones[] = "⚕️ {$factor}. Aplicar protocolo T1 o T2 antes de IATF.";
+            } elseif (str_contains($factor, 'Condición corporal')) {
+                $recomendaciones[] = "🥗 {$factor}. Mejorar nutrición y suplementación.";
+            } elseif (str_contains($factor, 'posparto')) {
+                $recomendaciones[] = "⏱️ {$factor}. Considerar esperar más tiempo para recuperación.";
+            } elseif (str_contains($factor, 'desparasitado')) {
+                $recomendaciones[] = "💉 {$factor}. Realizar desparasitación antes de IATF.";
+            } elseif (str_contains($factor, 'Hora de IATF')) {
+                $recomendaciones[] = "🕐 {$factor}. Ajustar horario de inseminación a ventana 6-10 AM.";
+            } elseif (str_contains($factor, 'Semental')) {
+                $recomendaciones[] = "🐂 {$factor}. Considerar cambiar a semental de mayor calidad.";
+            } else {
+                $recomendaciones[] = "⚠️ {$factor}";
+            }
+        }
+
+        if (empty($recomendaciones) && $probabilidad >= 70) {
+            $recomendaciones[] = "✅ Condiciones óptimas para IATF. Continuar con protocolo estándar.";
+        }
+
+        return implode("\n", $recomendaciones);
     }
 
     /**
@@ -131,205 +455,54 @@ class PredictionController extends Controller
     }
 
     /**
-     * Preparar datos para el modelo ML
+     * Registrar resultado real de la predicción
      */
-    private function prepararDatosParaML($iatfRecord)
+    public function registrarResultado(Request $request, $id)
     {
-        $animal = $iatfRecord->animal;
-        $semental = $iatfRecord->semental;
+        $prediction = Prediction::find($id);
 
-        return [
-            // Variables del Animal
-            'edad_meses' => $animal->edad_meses,
-            'peso_kg' => $animal->peso_kg,
-            'condicion_corporal' => $animal->condicion_corporal,
-            'numero_partos' => $animal->numero_partos,
-            'dias_posparto' => $animal->dias_posparto,
-            'dias_abiertos' => $animal->dias_abiertos,
-            'historial_abortos' => $animal->historial_abortos ? 1 : 0,
-            'enfermedades_reproductivas' => $animal->enfermedades_reproductivas ? 1 : 0,
-            
-            // Variables del Registro IATF
-            'condicion_ovarica_od' => $iatfRecord->condicion_ovarica_od,
-            'condicion_ovarica_oi' => $iatfRecord->condicion_ovarica_oi,
-            'tono_uterino' => $iatfRecord->tono_uterino,
-            'tratamiento_previo' => $iatfRecord->tratamiento_previo,
-            'dias_tonificacion' => $iatfRecord->dias_tonificacion,
-            'sal_mineral_gr' => $iatfRecord->sal_mineral_gr,
-            'modivitasan_ml' => $iatfRecord->modivitasan_ml,
-            'fosfoton_ml' => $iatfRecord->fosfoton_ml,
-            'seve_ml' => $iatfRecord->seve_ml,
-            'desparasitacion_previa' => $iatfRecord->desparasitacion_previa ? 1 : 0,
-            'vitaminas_aplicadas' => $iatfRecord->vitaminas_aplicadas ? 1 : 0,
-            'dispositivo_dib' => $iatfRecord->dispositivo_dib ? 1 : 0,
-            'estradiol_ml' => $iatfRecord->estradiol_ml,
-            'retirada_dib' => $iatfRecord->retirada_dib ? 1 : 0,
-            'ecg_ml' => $iatfRecord->ecg_ml,
-            'pf2_alpha_ml' => $iatfRecord->pf2_alpha_ml,
-            'epoca_anio' => $iatfRecord->epoca_anio,
-            'temperatura_ambiente' => $iatfRecord->temperatura_ambiente,
-            'humedad_relativa' => $iatfRecord->humedad_relativa,
-            'estres_manejo' => $iatfRecord->estres_manejo,
-            'calidad_pasturas' => $iatfRecord->calidad_pasturas,
-            'disponibilidad_agua' => $iatfRecord->disponibilidad_agua,
-            'gestacion_previa' => $iatfRecord->gestacion_previa ? 1 : 0,
-            'dias_gestacion_previa' => $iatfRecord->dias_gestacion_previa,
-            
-            // Variables del Semental (si existe)
-            'calidad_seminal' => $semental->calidad_seminal ?? null,
-            'concentracion_espermatica' => $semental->concentracion_espermatica ?? null,
-            'morfologia_espermatica' => $semental->morfologia_espermatica ?? null,
-            'tasa_historica_prenez_semental' => $semental->tasa_historica_prenez ?? null,
-        ];
-    }
-
-    /**
-     * Llamar a la API de Machine Learning (Python/Flask)
-     * NOTA: Usar cuando tengas la API ML funcionando
-     */
-    private function llamarAPIML($datos)
-    {
-        try {
-            $response = Http::timeout(30)->post(env('ML_API_URL', 'http://localhost:5000/api/predict'), [
-                'data' => $datos,
-            ]);
-
-            if ($response->successful()) {
-                return $response->json();
-            }
-
-            throw new \Exception('Error en la API de ML: ' . $response->body());
-        } catch (\Exception $e) {
-            // Si falla, usar simulación
-            return $this->simularPrediccion($datos);
-        }
-    }
-
-    /**
-     * Simular predicción (TEMPORAL - mientras no tengas Python)
-     */
-    private function simularPrediccion($datos)
-    {
-        // Algoritmo simple de scoring basado en las variables más importantes
-        $score = 50; // Base: 50%
-
-        // Condición corporal (muy importante)
-        if (isset($datos['condicion_corporal'])) {
-            if ($datos['condicion_corporal'] >= 3.0 && $datos['condicion_corporal'] <= 3.5) {
-                $score += 15;
-            } elseif ($datos['condicion_corporal'] < 2.5) {
-                $score -= 20;
-            }
+        if (!$prediction) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Predicción no encontrada',
+            ], 404);
         }
 
-        // Días posparto (importante)
-        if (isset($datos['dias_posparto'])) {
-            if ($datos['dias_posparto'] >= 60 && $datos['dias_posparto'] <= 90) {
-                $score += 10;
-            } elseif ($datos['dias_posparto'] < 45) {
-                $score -= 15;
-            }
+        $validator = Validator::make($request->all(), [
+            'resultado_real' => 'required|boolean',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Error de validación',
+                'errors' => $validator->errors(),
+            ], 422);
         }
 
-        // Condición ovárica
-        if (in_array($datos['condicion_ovarica_od'], ['C', 'CL', 'FD'])) {
-            $score += 10;
-        }
-        if (in_array($datos['condicion_ovarica_oi'], ['C', 'CL', 'FD'])) {
-            $score += 10;
-        }
+        // Actualizar resultado real
+        $prediction->resultado_real = $request->resultado_real;
+        
+        // Verificar si la predicción fue correcta
+        $prediction->prediccion_correcta = (
+            $prediction->prediccion_binaria === $request->resultado_real
+        );
+        
+        $prediction->save();
 
-        // Tono uterino
-        if (isset($datos['tono_uterino']) && $datos['tono_uterino'] >= 60) {
-            $score += 8;
-        }
+        // Registrar actividad
+        ActivityLog::registrar(
+            'actualizar',
+            'Prediction',
+            $prediction->id,
+            "Resultado real registrado: " . ($request->resultado_real ? 'gestante' : 'no gestante')
+        );
 
-        // Historial de abortos (negativo)
-        if ($datos['historial_abortos'] == 1) {
-            $score -= 12;
-        }
-
-        // Enfermedades reproductivas (negativo)
-        if ($datos['enfermedades_reproductivas'] == 1) {
-            $score -= 15;
-        }
-
-        // Calidad del semental
-        if (isset($datos['calidad_seminal']) && $datos['calidad_seminal'] >= 70) {
-            $score += 8;
-        }
-
-        // Normalizar entre 0 y 1
-        $probabilidad = max(0.1, min(0.95, $score / 100));
-
-        // Determinar nivel de confianza
-        if ($probabilidad >= 0.7) {
-            $nivelConfianza = 'alto';
-        } elseif ($probabilidad >= 0.4) {
-            $nivelConfianza = 'medio';
-        } else {
-            $nivelConfianza = 'bajo';
-        }
-
-        // Generar recomendaciones
-        $recomendaciones = $this->generarRecomendaciones($datos, $probabilidad);
-
-        return [
-            'probabilidad_prenez' => round($probabilidad, 4),
-            'prediccion_binaria' => $probabilidad >= 0.5,
-            'nivel_confianza' => $nivelConfianza,
-            'modelo_usado' => 'SimulacionTemporalV1',
-            'version_modelo' => '1.0.0',
-            'metricas' => [
-                'accuracy' => 0.7500,
-                'precision' => 0.7200,
-                'recall' => 0.7000,
-                'f1_score' => 0.7100,
-                'roc_auc' => 0.8000,
-            ],
-            'top_features' => [
-                ['feature' => 'condicion_corporal', 'importance' => 0.25],
-                ['feature' => 'dias_posparto', 'importance' => 0.20],
-                ['feature' => 'condicion_ovarica', 'importance' => 0.18],
-                ['feature' => 'tono_uterino', 'importance' => 0.15],
-                ['feature' => 'calidad_seminal', 'importance' => 0.12],
-            ],
-            'recomendaciones' => $recomendaciones,
-        ];
-    }
-
-    /**
-     * Generar recomendaciones basadas en los datos
-     */
-    private function generarRecomendaciones($datos, $probabilidad)
-    {
-        $recomendaciones = [];
-
-        if ($probabilidad < 0.4) {
-            $recomendaciones[] = "⚠️ Probabilidad baja de preñez. Considere evaluar las condiciones del animal.";
-        }
-
-        if (isset($datos['condicion_corporal']) && $datos['condicion_corporal'] < 2.5) {
-            $recomendaciones[] = "🔸 Mejorar condición corporal (actualmente {$datos['condicion_corporal']}). Meta: 3.0-3.5";
-        }
-
-        if (isset($datos['dias_posparto']) && $datos['dias_posparto'] < 60) {
-            $recomendaciones[] = "⏱️ Animal con {$datos['dias_posparto']} días posparto. Considere esperar hasta 60+ días.";
-        }
-
-        if ($datos['enfermedades_reproductivas'] == 1) {
-            $recomendaciones[] = "🏥 Animal con historial de enfermedades reproductivas. Requiere seguimiento veterinario.";
-        }
-
-        if ($datos['historial_abortos'] == 1) {
-            $recomendaciones[] = "⚠️ Animal con historial de abortos. Monitoreo especial recomendado.";
-        }
-
-        if (empty($recomendaciones)) {
-            $recomendaciones[] = "✅ Condiciones favorables para IATF. Continuar con protocolo estándar.";
-        }
-
-        return implode("\n", $recomendaciones);
+        return response()->json([
+            'success' => true,
+            'message' => 'Resultado registrado exitosamente',
+            'data' => $prediction,
+        ]);
     }
 
     /**
@@ -357,5 +530,37 @@ class PredictionController extends Controller
                 'promedio_confianza' => round($promedioConfianza * 100, 2),
             ],
         ]);
+    }
+
+    /**
+     * Verificar estado de la API Flask
+     */
+    public function healthCheck()
+    {
+        try {
+            $apiUrl = env('ML_API_URL', 'http://localhost:5000');
+            $response = Http::timeout(5)->get("{$apiUrl}/health");
+            
+            if ($response->successful()) {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'API Flask disponible',
+                    'data' => $response->json()
+                ]);
+            }
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'API Flask no responde correctamente',
+                'status_code' => $response->status()
+            ], 503);
+            
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No se pudo conectar a la API Flask',
+                'error' => $e->getMessage()
+            ], 503);
+        }
     }
 }
